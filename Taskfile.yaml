@@ -1,0 +1,150 @@
+version: '3'
+
+# =============================================================================
+#  game-engine  —  Taskfile  (replaces the Makefile / CMake)
+#
+#    go-task                 # build the dev engine -> build/main-dev
+#    go-task run             # build + run
+#    go-task build CHANNEL=live
+#    go-task shaders         # compile GLSL -> SPIR-V
+#    go-task jolt            # build the Jolt Physics static lib (cached)
+#    go-task windows         # cross-compile a Windows .exe (mingw-w64)
+#    go-task clean / distclean
+#    go-task --list          # list tasks
+#
+#  Channels map to compile defines (see cflags.txt):
+#    dev  -> -Dccdev    (isDev == true,  extra debugging)
+#    live -> -Dcclive   (isDev == false)
+# =============================================================================
+
+vars:
+  CHANNEL: '{{.CHANNEL | default "dev"}}'
+  CXX: '{{.CXX | default "g++"}}'
+  CXX_WIN: '{{.CXX_WIN | default "x86_64-w64-mingw32-g++"}}'
+  GLSLC: '{{.GLSLC | default "glslc"}}'
+  OPT: '{{.OPT | default "-O2 -g"}}'
+  ARCH: -msse4.2 -mpopcnt -mfpmath=sse
+
+tasks:
+  default:
+    deps: [build]
+
+  build:
+    desc: Build the engine -> build/main-<CHANNEL>
+    deps: [shaders, jolt]
+    silent: true
+    cmds:
+      - |
+        set -e
+        CHANNEL="{{.CHANNEL}}"
+        CHANNEL_FLAGS="$(awk -v c="$CHANNEL" '$1==c{ $1=""; print }' cflags.txt)"
+        [ -z "$CHANNEL_FLAGS" ] && CHANNEL_FLAGS="-Dccdev"
+        INC="-Isrc"
+        for d in modules/*/include; do INC="$INC -I$d"; done
+        INC="$INC -Ilibs/SDL3/include -Ilibs/json/include -Ilibs/nuklear -Ilibs/cgltf -Ilibs/JoltPhysics -Ilibs/nanosvg"
+        SRC="$(find src -name '*.cpp')"
+        JOLT=""; PHYS=""
+        if [ -e libs/JoltPhysics/Jolt/Jolt.h ]; then
+          # JPH_NO_DEBUG keeps the engine's Jolt config matching the NDEBUG-built lib.
+          JOLT="-DENGINE_WITH_JOLT -DJPH_NO_DEBUG"; PHYS="build/libJolt.a"
+        fi
+        mkdir -p build
+        # Give the bundled libSDL3.so its SONAME alias so the loader matches our headers.
+        ln -sf libSDL3.so libs/SDL3/lib/libSDL3.so.0
+        echo ">>> Linking build/main-$CHANNEL"
+        {{.CXX}} -std=c++20 -Wall -Wextra -Wno-unused-parameter {{.ARCH}} $CHANNEL_FLAGS {{.OPT}} $JOLT \
+          $INC $SRC libs/SDL3/lib/libSDL3.so $PHYS -lm -lpthread \
+          -Wl,-rpath,'$ORIGIN/../libs/SDL3/lib' -Wl,-rpath,'$ORIGIN' \
+          -o build/main-$CHANNEL
+        echo "    OK -> build/main-$CHANNEL"
+    sources:
+      - 'src/**/*.cpp'
+      - 'src/**/*.hpp'
+      - 'modules/**/include/*.hpp'
+      - 'shaders/*.spv'
+    generates:
+      - 'build/main-{{.CHANNEL}}'
+
+  shaders:
+    desc: Compile GLSL shaders to SPIR-V
+    silent: true
+    cmds:
+      - |
+        for s in shaders/*.vert shaders/*.frag; do
+          [ -e "$s" ] || continue
+          if [ ! -f "$s.spv" ] || [ "$s.spv" -ot "$s" ]; then
+            echo ">>> glslc $s -> $s.spv"
+            {{.GLSLC}} "$s" -o "$s.spv"
+          fi
+        done
+    sources:
+      - 'shaders/*.vert'
+      - 'shaders/*.frag'
+    generates:
+      - 'shaders/*.spv'
+
+  jolt:
+    desc: Build the Jolt Physics static lib (compiled from source, cached)
+    silent: true
+    status:
+      # up-to-date if Jolt isn't present, or the archive already exists
+      - test ! -e libs/JoltPhysics/Jolt/Jolt.h || test -f build/libJolt.a
+    cmds:
+      - |
+        set -e
+        if [ ! -e libs/JoltPhysics/Jolt/Jolt.h ]; then
+          echo "Jolt not present (run tools/fetch-deps.sh) — building without physics"
+          exit 0
+        fi
+        echo ">>> building Jolt Physics static lib (one-time, then cached)"
+        find libs/JoltPhysics/Jolt -name '*.cpp' | while IFS= read -r f; do
+          o="build/jolt/${f%.cpp}.o"
+          mkdir -p "$(dirname "$o")"
+          if [ ! -f "$o" ] || [ "$o" -ot "$f" ]; then
+            {{.CXX}} -std=c++17 -O2 {{.ARCH}} -Ilibs/JoltPhysics -DNDEBUG -ffp-contract=off -c "$f" -o "$o"
+          fi
+        done
+        ar rcs build/libJolt.a $(find build/jolt -name '*.o')
+        echo "    OK -> build/libJolt.a"
+
+  windows:
+    desc: Cross-compile a Windows .exe (mingw-w64; physics stubbed)
+    deps: [shaders]
+    silent: true
+    cmds:
+      - |
+        command -v {{.CXX_WIN}} >/dev/null 2>&1 || { echo "mingw-w64 not found, skipping"; exit 0; }
+        CHANNEL="{{.CHANNEL}}"
+        CHANNEL_FLAGS="$(awk -v c="$CHANNEL" '$1==c{ $1=""; print }' cflags.txt)"
+        [ -z "$CHANNEL_FLAGS" ] && CHANNEL_FLAGS="-Dccdev"
+        INC="-Isrc"
+        for d in modules/*/include; do INC="$INC -I$d"; done
+        INC="$INC -Ilibs/SDL3/include -Ilibs/json/include -Ilibs/nuklear -Ilibs/cgltf -Ilibs/JoltPhysics -Ilibs/nanosvg"
+        echo ">>> Windows build (physics stubbed)"
+        {{.CXX_WIN}} -std=c++20 -Wall -Wextra -Wno-unused-parameter {{.ARCH}} $CHANNEL_FLAGS {{.OPT}} \
+          $INC $(find src -name '*.cpp') \
+          -Llibs/SDL3/lib -lSDL3 -static-libgcc -static-libstdc++ \
+          -o build/main-$CHANNEL-x64.exe || echo "windows build failed (non-fatal)"
+
+  run:
+    desc: Build then run the engine
+    deps: [build]
+    cmds:
+      - echo "=== START OF OUTPUT ==="
+      - './build/main-{{.CHANNEL}}'
+
+  clean:
+    desc: Remove build artifacts (keeps the cached Jolt lib)
+    cmds:
+      - rm -rf build/obj build/main-{{.CHANNEL}} build/main-*-x64.exe shaders/*.spv
+
+  distclean:
+    desc: Also remove the cached Jolt static lib
+    deps: [clean]
+    cmds:
+      - rm -rf build/jolt build/libJolt.a
+
+  docs:
+    desc: Where the documentation lives
+    cmds:
+      - 'echo "Documentation lives in docs/  (start at docs/README.md)"'

@@ -1,11 +1,10 @@
 [submodule "libs/SDL3"]
 	path = libs/SDL3
 	url = https://github.com/libsdl-org/SDL
-	
+
 [submodule "libs/json"]
 	path = libs/json
 	url = https://github.com/nlohmann/json
 
-[submodule "libs/TGUI"]
-	path = libs/TGUI
-	url = https://github.com/texus/TGUI
+# Nuklear (UI), cgltf + stb_image (GLB/textures) and Jolt (physics) are fetched
+# as plain vendored files by tools/fetch-deps.sh rather than git submodules.

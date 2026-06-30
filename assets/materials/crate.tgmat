@@ -1,0 +1,11 @@
+// crate.tgmat — warm orange crate. If g_tColor resolves to a real image it is
+// multiplied over the tint; otherwise the flat tint is used.
+Material
+{
+    shader        "mesh"
+    g_tColor      "assets/textures/crate.png"
+    g_vColorTint  [0.85 0.52 0.24 1.0]
+    g_flMetalness 0.05
+    g_flRoughness 0.45
+    g_flAmbient   0.16
+}

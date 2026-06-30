@@ -1,0 +1,9 @@
+// grid.tgmat — desaturated blue-grey floor (Source dev-texture vibe)
+Material
+{
+    shader        "mesh"
+    g_vColorTint  [0.32 0.36 0.42 1.0]
+    g_flMetalness 0.0
+    g_flRoughness 0.7
+    g_flAmbient   0.22
+}

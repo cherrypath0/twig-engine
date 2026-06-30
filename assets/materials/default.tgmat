@@ -1,0 +1,10 @@
+// default.tgmat — neutral grey surface
+// Source 2-style material. Keys accept g_* names or friendly aliases.
+Material
+{
+    shader        "mesh"
+    g_vColorTint  [0.80 0.80 0.82 1.0]
+    g_flMetalness 0.0
+    g_flRoughness 0.55
+    g_flAmbient   0.18
+}

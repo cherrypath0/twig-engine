@@ -1,6 +1,14 @@
-[13:05:19] [main/WARN]: Current channel is DEV, extended debugging is enabled
-[13:05:19] [main/INFO]: Initializing engine
-[13:05:19] [main/INFO]: Video driver: wayland
-[13:05:19] [main/INFO]: Renderer: vulkan
-[13:05:19] [main/INFO]: GPU device: NVIDIA GeForce RTX 5060 Ti
-[13:05:19] [main/INFO]: GPU driver version: NVIDIA 610.43.2.0
+[23:55:30] [main/WARN]: Current channel is DEV, extended debugging is enabled
+[23:55:30] [main/INFO]: Initializing engine
+[23:55:30] [engine/INFO]: Video driver: wayland
+[23:55:30] [engine/INFO]: Renderer backend: vulkan
+[23:55:31] [render/INFO]: Renderer ready (swapchain format 12)
+[23:55:31] [nuklear_backend/INFO]: Nuklear UI backend ready (font atlas 512x2048)
+[23:55:31] [physics/INFO]: Jolt Physics initialized (31 worker threads)
+[23:55:31] [icons/INFO]: IconSet: loaded 30 icons from assets/icons (48x48)
+[23:55:31] [project/INFO]: Created new project at /tmp/wf_grp
+[23:55:31] [material/INFO]: Loaded material 'crate' (shader=mesh)
+[23:55:31] [material/INFO]: Loaded material 'default' (shader=mesh)
+[23:55:31] [material/INFO]: Loaded material 'grid' (shader=mesh)
+[23:55:35] [model/INFO]: Loaded GLB '/tmp/wf_grp/assets/models/DR1A_Train_Blue.glb': 112 primitive(s)
+[23:55:36] [main/INFO]: Clean shutdown
