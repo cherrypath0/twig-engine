@@ -25,12 +25,16 @@ struct Material {
     std::string color_texture;               // optional path
     em::vec4    color_tint {1, 1, 1, 1};
     float       metalness = 0.0f;
-    float       roughness = 0.5f;
+    float       roughness = 0.8f;
     float       ambient   = 0.15f;
 
     // Resolved GPU state (filled by resolve_gpu).
     SDL_GPUTexture* tex = nullptr;
     bool use_texture = false;
+    // Extra PBR maps (set by the GLB importer). tex_mr packs roughness in G and
+    // metalness in B (glTF convention); tex_normal is a tangent-space normal map.
+    SDL_GPUTexture* tex_mr = nullptr;      bool use_mr = false;
+    SDL_GPUTexture* tex_normal = nullptr;  bool use_normal = false;
 };
 
 namespace material {

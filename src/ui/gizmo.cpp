@@ -114,19 +114,29 @@ GizmoResult Gizmo::manipulate(nk_context* ctx, Transform& xform, const Camera& c
 
     // ----- determine which handle (if any) the mouse is near -----------------
     int hot_axis = -1;
-    bool over_ring = false;
     if (o.visible) {
         if (mode == GizmoMode::Rotate) {
-            // Ring screen radius = project a point 0.9*world_len out (matches the 3D torus).
-            em::vec3 rpw = origin + cam.right() * (0.9f * world_len);
-            Projected rpp = project(vp, rpw, vx, vy, sw, sh);
-            float ring_r = rpp.visible
-                ? std::sqrt((rpp.screen.x - o.screen.x) * (rpp.screen.x - o.screen.x) +
-                            (rpp.screen.y - o.screen.y) * (rpp.screen.y - o.screen.y))
-                : kRingRadiusPx;
-            float dx = mx - o.screen.x, dy = my - o.screen.y;
-            float d  = std::sqrt(dx * dx + dy * dy);
-            if (std::fabs(d - ring_r) <= kHandlePickDist * 1.6f) over_ring = true;
+            // Pick the closest of the three axis rings (X/Y/Z) by sampling each
+            // ring in world space and measuring the screen distance to the mouse.
+            float best = kHandlePickDist * 1.8f;
+            for (int i = 0; i < 3; ++i) {
+                em::vec3 n = axis_dir[i];
+                em::vec3 ref = (std::fabs(n.y) > 0.9f) ? em::vec3{1, 0, 0} : em::vec3{0, 1, 0};
+                em::vec3 u = em::normalize(em::cross(ref, n));
+                em::vec3 v = em::cross(n, u);
+                const int SEG = 40;
+                Projected prev{}; bool have_prev = false;
+                for (int s = 0; s <= SEG; ++s) {
+                    float a = (float)s / SEG * 6.2831853f;
+                    em::vec3 p = origin + (u * std::cos(a) + v * std::sin(a)) * (0.9f * world_len);
+                    Projected pp = project(vp, p, vx, vy, sw, sh);
+                    if (have_prev && pp.visible && prev.visible) {
+                        float dd = dist_point_segment({mx, my}, prev.screen, pp.screen);
+                        if (dd < best) { best = dd; hot_axis = i; }
+                    }
+                    prev = pp; have_prev = true;
+                }
+            }
         } else {
             float best = kHandlePickDist;
             for (int i = 0; i < 3; ++i) {
@@ -188,10 +198,17 @@ GizmoResult Gizmo::manipulate(nk_context* ctx, Transform& xform, const Camera& c
                     *s = std::round(*s / step) * step;
                     if (*s < 0.001f) *s = step;
                 }
-            } else if (mode == GizmoMode::Rotate) {
-                // Rotate about the camera view direction by the tangential drag.
-                // Use horizontal drag as the angle for a predictable result.
-                float angle = dmx * kRotateGain;
+            } else if (mode == GizmoMode::Rotate && axis_ >= 0) {
+                // Rotate about the SELECTED axis (X/Y/Z) by the change in the
+                // mouse's angle around the gizmo centre — a proper per-axis ring.
+                float a0 = std::atan2(last_my_ - o.screen.y, last_mx_ - o.screen.x);
+                float a1 = std::atan2(my - o.screen.y, mx - o.screen.x);
+                float dAng = a1 - a0;
+                if (dAng >  3.14159265f) dAng -= 6.2831853f;
+                if (dAng < -3.14159265f) dAng += 6.2831853f;
+                // Flip when the axis faces away from the camera so it tracks the ring.
+                float sgn = (em::dot(axis_dir[axis_], em::normalize(cam.forward())) > 0.0f) ? -1.0f : 1.0f;
+                float angle = dAng * sgn;
                 if (snap_rot_deg > 0.0f) {   // quantise the drag into fixed steps
                     float step = (ctrl ? snap_rot_deg * 0.125f : snap_rot_deg) * 0.0174532925f;
                     rot_accum_ += angle; angle = 0.0f;
@@ -199,8 +216,7 @@ GizmoResult Gizmo::manipulate(nk_context* ctx, Transform& xform, const Camera& c
                     while (rot_accum_ <= -step) { angle -= step; rot_accum_ += step; }
                 }
                 if (angle != 0.0f) {
-                    em::vec3 view_axis = em::normalize(cam.forward());
-                    em::quat dq = em::quat::from_axis_angle(view_axis, angle);
+                    em::quat dq = em::quat::from_axis_angle(axis_dir[axis_], angle);
                     const em::quat& q = xform.rotation;
                     xform.rotation = em::quat{
                         dq.w*q.x + dq.x*q.w + dq.y*q.z - dq.z*q.y,
@@ -216,20 +232,17 @@ GizmoResult Gizmo::manipulate(nk_context* ctx, Transform& xform, const Camera& c
             result.active = true;
         }
     } else if (just_pressed) {
-        // Begin a drag if the press landed on a handle.
+        // Begin a drag if the press landed on a handle (rotate is now per-axis too).
         bool started = false;
-        if (mode == GizmoMode::Rotate) {
-            if (over_ring) { dragging_ = true; axis_ = -1; result.active = true; started = true; rot_accum_ = 0.0f; }
-        } else if (hot_axis >= 0) {
+        if (hot_axis >= 0) {
             dragging_ = true; axis_ = hot_axis; result.active = true; started = true; rot_accum_ = 0.0f;
         }
         // Shift + drag-start duplicates the selection (the drag then moves the clone).
         if (started && nk_input_is_key_down(&ctx->input, NK_KEY_SHIFT)) result.clone = true;
     }
 
-    result.hovered = (hot_axis >= 0) || over_ring || dragging_;
-    if (mode == GizmoMode::Rotate) result.axis = (over_ring || dragging_) ? 3 : -1;
-    else                           result.axis = dragging_ ? axis_ : hot_axis;
+    result.hovered = (hot_axis >= 0) || dragging_;
+    result.axis    = dragging_ ? axis_ : hot_axis;
 
     // ----- draw the overlay --------------------------------------------------
     // A fullscreen, input-less, chromeless window whose canvas we stroke onto.
@@ -244,7 +257,7 @@ GizmoResult Gizmo::manipulate(nk_context* ctx, Transform& xform, const Camera& c
         struct nk_command_buffer* canvas = nk_window_get_canvas(ctx);
         if (canvas && o.visible && draw_overlay) {
             if (mode == GizmoMode::Rotate) {
-                struct nk_color col = over_ring || dragging_
+                struct nk_color col = (hot_axis >= 0) || dragging_
                     ? nk_rgb(255, 230, 120) : nk_rgb(220, 200, 90);
                 struct nk_rect rr = nk_rect(o.screen.x - kRingRadiusPx,
                                             o.screen.y - kRingRadiusPx,

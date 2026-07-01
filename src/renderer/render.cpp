@@ -7,9 +7,12 @@
 #include "material/material.hpp"
 #include "gpu/gpu.hpp"
 #include "ui/nuklear_backend.hpp"
+#include "stb_image_write.h"   // stbi_write_png (impl lives in thirdparty.cpp)
 
 #include <cstddef>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 static constexpr SDL_GPUTextureFormat DEPTH_FORMAT = SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
 
@@ -99,6 +102,32 @@ void g_frustum(MeshData& m) {   // camera frustum wireframe (apex -> -Z), LINE L
     for (int i = 0; i < 4; ++i) line(a, c[i]);
     for (int i = 0; i < 4; ++i) line(c[i], c[(i + 1) % 4]);
 }
+// Light gizmo line meshes. All emit along local -Y (matching the light dir
+// convention), so the entity's world matrix orients them automatically.
+static void g_line(MeshData& m, em::vec3 p, em::vec3 q) {
+    uint32_t b = (uint32_t)m.vertices.size();
+    m.vertices.push_back({p, {0, 1, 0}, {0, 0}});
+    m.vertices.push_back({q, {0, 1, 0}, {0, 0}});
+    m.indices.push_back(b); m.indices.push_back(b + 1);
+}
+void g_light_cone(MeshData& m) {          // spot: apex at origin, base ring at y=-1 r=1
+    const int seg = 24;
+    for (int i = 0; i < seg; ++i) {
+        float a0 = (float)i / seg * kTau, a1 = (float)(i + 1) / seg * kTau;
+        g_line(m, {std::cos(a0), -1.0f, std::sin(a0)}, {std::cos(a1), -1.0f, std::sin(a1)});
+    }
+    for (int i = 0; i < 4; ++i) { float a = (float)i / 4 * kTau; g_line(m, {0, 0, 0}, {std::cos(a), -1.0f, std::sin(a)}); }
+}
+void g_light_arrow(MeshData& m) {         // directional: parallel rays + arrowhead
+    for (int i = -1; i <= 1; ++i) { float o = (float)i * 0.35f; g_line(m, {o, 0.6f, 0}, {o, -0.8f, 0}); }
+    g_line(m, {0, -0.8f, 0}, {0.18f, -0.45f, 0});  g_line(m, {0, -0.8f, 0}, {-0.18f, -0.45f, 0});
+    g_line(m, {0, -0.8f, 0}, {0, -0.45f, 0.18f});  g_line(m, {0, -0.8f, 0}, {0, -0.45f, -0.18f});
+}
+void g_light_quad(MeshData& m) {          // area: unit rectangle in XZ + direction stub
+    em::vec3 c[4] = {{-0.5f, 0, -0.5f}, {0.5f, 0, -0.5f}, {0.5f, 0, 0.5f}, {-0.5f, 0, 0.5f}};
+    for (int i = 0; i < 4; ++i) g_line(m, c[i], c[(i + 1) % 4]);
+    g_line(m, {0, 0, 0}, {0, -0.6f, 0});
+}
 // Column-major model matrix from a scaled orthonormal basis + translation.
 em::mat4 g_model(em::vec3 x, em::vec3 y, em::vec3 z, em::vec3 t, float s) {
     em::mat4 m{};
@@ -120,7 +149,9 @@ bool Renderer::init(SDL_GPUDevice* dev, SDL_Window* window) {
 
     SDL_GPUShader* vs = gpu::load_spirv(dev, "shaders/mesh.vert.spv", 0, 0, 1);
     SDL_GPUShader* fs = gpu::load_spirv(dev, "shaders/mesh.frag.spv", 1, 1, 1);
-    if (!vs || !fs) { warnln("Renderer: mesh shaders failed to load"); return false; }
+    SDL_GPUShader* fs_lit = gpu::load_spirv(dev, "shaders/mesh_lit.frag.spv", 1, 4, 1);
+    SDL_GPUShader* shadow_fs = gpu::load_spirv(dev, "shaders/shadow.frag.spv", 1, 0, 0);
+    if (!vs || !fs || !fs_lit || !shadow_fs) { warnln("Renderer: mesh shaders failed to load"); return false; }
 
     SDL_GPUVertexBufferDescription vb{};
     vb.slot = 0;
@@ -137,7 +168,7 @@ bool Renderer::init(SDL_GPUDevice* dev, SDL_Window* window) {
 
     SDL_GPUGraphicsPipelineCreateInfo pci{};
     pci.vertex_shader = vs;
-    pci.fragment_shader = fs;
+    pci.fragment_shader = fs_lit;   // main scene pass = lit + shadowed shader
     pci.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
     pci.vertex_input_state.vertex_buffer_descriptions = &vb;
     pci.vertex_input_state.num_vertex_buffers = 1;
@@ -155,6 +186,10 @@ bool Renderer::init(SDL_GPUDevice* dev, SDL_Window* window) {
     pci.target_info.depth_stencil_format = DEPTH_FORMAT;
 
     mesh_pipeline_ = SDL_CreateGPUGraphicsPipeline(dev, &pci);
+
+    // Overlays (gizmo + colliders) use the simpler 1-sampler mesh.frag so they
+    // never need the shadow map bound.
+    pci.fragment_shader = fs;
 
     // Gizmo handles reuse the mesh pipeline settings (depth test ON so they
     // self-occlude correctly); "always on top" comes from CLEARING the depth
@@ -185,8 +220,60 @@ bool Renderer::init(SDL_GPUDevice* dev, SDL_Window* window) {
     cp.primitive_type = SDL_GPU_PRIMITIVETYPE_LINELIST;   // clean edges / rings
     collider_edge_pipeline_ = SDL_CreateGPUGraphicsPipeline(dev, &cp);
 
+    // Depth-tested variants: same look, but occluded by scene geometry (depth
+    // test ON, no depth write) so colliders can be drawn "behind" objects.
+    SDL_GPUGraphicsPipelineCreateInfo cpd = cp;   // currently LINELIST
+    cpd.target_info.has_depth_stencil_target = true;
+    cpd.target_info.depth_stencil_format = DEPTH_FORMAT;
+    cpd.depth_stencil_state.enable_depth_test = true;
+    cpd.depth_stencil_state.enable_depth_write = false;
+    cpd.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS_OR_EQUAL;
+    collider_edge_depth_ = SDL_CreateGPUGraphicsPipeline(dev, &cpd);
+    cpd.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    cpd.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    collider_fill_depth_ = SDL_CreateGPUGraphicsPipeline(dev, &cpd);
+    cpd.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_LINE;
+    collider_line_depth_ = SDL_CreateGPUGraphicsPipeline(dev, &cpd);
+
+    // Sun shadow map: depth-only pass rendered from the light's point of view.
+    {
+        SDL_GPUGraphicsPipelineCreateInfo sp{};
+        sp.vertex_shader = vs;
+        sp.fragment_shader = shadow_fs;
+        sp.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+        sp.vertex_input_state.vertex_buffer_descriptions = &vb;
+        sp.vertex_input_state.num_vertex_buffers = 1;
+        sp.vertex_input_state.vertex_attributes = attrs;
+        sp.vertex_input_state.num_vertex_attributes = 3;
+        sp.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+        sp.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+        sp.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+        sp.rasterizer_state.enable_depth_bias = true;         // combat shadow acne
+        sp.rasterizer_state.depth_bias_constant_factor = 1.25f;
+        sp.rasterizer_state.depth_bias_slope_factor = 2.5f;
+        sp.depth_stencil_state.enable_depth_test = true;
+        sp.depth_stencil_state.enable_depth_write = true;
+        sp.depth_stencil_state.compare_op = SDL_GPU_COMPAREOP_LESS;
+        sp.target_info.num_color_targets = 0;
+        sp.target_info.has_depth_stencil_target = true;
+        sp.target_info.depth_stencil_format = DEPTH_FORMAT;
+        shadow_pipeline_ = SDL_CreateGPUGraphicsPipeline(dev, &sp);
+
+        shadow_dim_ = 2048;
+        SDL_GPUTextureCreateInfo sci{};
+        sci.type = SDL_GPU_TEXTURETYPE_2D;
+        sci.format = DEPTH_FORMAT;
+        sci.usage = SDL_GPU_TEXTUREUSAGE_DEPTH_STENCIL_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        sci.width = shadow_dim_; sci.height = shadow_dim_;
+        sci.layer_count_or_depth = 1; sci.num_levels = 1;
+        shadow_map_ = SDL_CreateGPUTexture(dev, &sci);
+        if (shadow_map_) SDL_SetGPUTextureName(dev, shadow_map_, "sun.shadow");
+    }
+
     SDL_ReleaseGPUShader(dev, vs);
     SDL_ReleaseGPUShader(dev, fs);
+    SDL_ReleaseGPUShader(dev, fs_lit);
+    SDL_ReleaseGPUShader(dev, shadow_fs);
     if (!mesh_pipeline_ || !gizmo_pipeline_) { warnln("Renderer: pipeline failed: %s", SDL_GetError()); return false; }
 
     // Build the procedural gizmo handle meshes once.
@@ -201,6 +288,9 @@ bool Renderer::init(SDL_GPUDevice* dev, SDL_Window* window) {
         MeshData be; g_box_edges(be); be.recompute_bounds(); collider_box_edges_ = model::upload(dev, be);
         MeshData rl; g_ring_line(rl, 48); rl.recompute_bounds(); collider_ring_ = model::upload(dev, rl);
         MeshData fr; g_frustum(fr); fr.recompute_bounds(); gizmo_frustum_ = model::upload(dev, fr);
+        MeshData lc; g_light_cone(lc);  lc.recompute_bounds(); light_cone_ = model::upload(dev, lc);
+        MeshData la; g_light_arrow(la); la.recompute_bounds(); light_dir_  = model::upload(dev, la);
+        MeshData lq; g_light_quad(lq);  lq.recompute_bounds(); light_quad_ = model::upload(dev, lq);
     }
 
     // ---- selection outline: post-process edge detection -------------------
@@ -268,6 +358,9 @@ void Renderer::shutdown() {
     if (collider_fill_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, collider_fill_pipeline_);
     if (collider_line_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, collider_line_pipeline_);
     if (collider_edge_pipeline_) SDL_ReleaseGPUGraphicsPipeline(dev_, collider_edge_pipeline_);
+    if (collider_fill_depth_) SDL_ReleaseGPUGraphicsPipeline(dev_, collider_fill_depth_);
+    if (collider_line_depth_) SDL_ReleaseGPUGraphicsPipeline(dev_, collider_line_depth_);
+    if (collider_edge_depth_) SDL_ReleaseGPUGraphicsPipeline(dev_, collider_edge_depth_);
     model::destroy(dev_, gizmo_arrow_);
     model::destroy(dev_, gizmo_scale_);
     model::destroy(dev_, gizmo_ring_);
@@ -319,7 +412,7 @@ bool Renderer::render(Scene& scene, Camera& cam,
                       NuklearBackend& ui,
                       float vp_x, float vp_y, float vp_w, float vp_h,
                       int selected, int gizmo_mode, bool gizmo_local, int gizmo_hot, bool show_colliders,
-                      const std::vector<int>& highlight) {
+                      bool colliders_xray, const std::vector<int>& highlight) {
     SDL_GPUCommandBuffer* cmd = SDL_AcquireGPUCommandBuffer(dev_);
     if (!cmd) { warnln("AcquireGPUCommandBuffer: %s", SDL_GetError()); return false; }
 
@@ -332,6 +425,25 @@ bool Renderer::render(Scene& scene, Camera& cam,
     }
     if (!swap || w == 0 || h == 0) { SDL_SubmitGPUCommandBuffer(cmd); return true; }
 
+    // When a screenshot is pending, render the whole frame into a downloadable
+    // offscreen target (swapchain textures can't be downloaded), then blit it to
+    // the window afterwards. `target` is where every color pass draws this frame.
+    SDL_GPUTexture* target = swap;
+    const bool capturing = !screenshot_path_.empty();
+    if (capturing) {
+        if (!capture_tex_ || cap_w_ != w || cap_h_ != h) {
+            if (capture_tex_) SDL_ReleaseGPUTexture(dev_, capture_tex_);
+            SDL_GPUTextureCreateInfo ci{};
+            ci.type = SDL_GPU_TEXTURETYPE_2D;
+            ci.format = (SDL_GPUTextureFormat)swap_fmt_;
+            ci.usage = SDL_GPU_TEXTUREUSAGE_COLOR_TARGET | SDL_GPU_TEXTUREUSAGE_SAMPLER;
+            ci.width = w; ci.height = h; ci.layer_count_or_depth = 1; ci.num_levels = 1;
+            capture_tex_ = SDL_CreateGPUTexture(dev_, &ci);
+            cap_w_ = w; cap_h_ = h;
+        }
+        if (capture_tex_) target = capture_tex_;
+    }
+
     // Upload UI geometry (copy pass) before any render pass begins.
     ui.prepare(cmd);
     ensure_depth(w, h);
@@ -341,9 +453,57 @@ bool Renderer::render(Scene& scene, Camera& cam,
     const em::mat4 view = cam.view();
     const em::mat4 proj = cam.proj(aspect);
 
+    // ---- Sun shadow map: render scene depth from the directional light ----
+    // Ortho frustum centered on the camera focus so the shadowed area follows
+    // the view. Standard directional-shadow setup.
+    em::mat4 lightVP = em::mat4::identity();
+    bool shadows_on = scene.sun_shadows && shadow_pipeline_ && shadow_map_;
+    if (shadows_on) {
+        // A visible Directional light with "Cast Shadows" overrides the sun dir.
+        em::vec3 sd = em::normalize(scene.sun_dir);
+        for (int li = 0; li < (int)scene.entities.size(); ++li) {
+            const Entity& le = scene.entities[li];
+            if (le.kind == InstanceKind::Light && le.visible && le.cast_shadows &&
+                le.light_type == LightType::Directional) {
+                em::mat4 lw = scene.world_matrix(li);
+                sd = em::normalize(em::vec3{-lw.m[1][0], -lw.m[1][1], -lw.m[1][2]});
+                break;
+            }
+        }
+        em::vec3 focus = {cam.position.x, 0.0f, cam.position.z};
+        const float R = 34.0f, dist = 70.0f;
+        em::vec3 eye = {focus.x - sd.x * dist, focus.y - sd.y * dist, focus.z - sd.z * dist};
+        em::vec3 up = (std::fabs(sd.y) > 0.95f) ? em::vec3{0, 0, 1} : em::vec3{0, 1, 0};
+        lightVP = em::ortho(-R, R, -R, R, 0.1f, dist * 2.0f) * em::look_at(eye, focus, up);
+
+        SDL_GPUDepthStencilTargetInfo sdt{};
+        sdt.texture = shadow_map_;
+        sdt.clear_depth = 1.0f;
+        sdt.load_op = SDL_GPU_LOADOP_CLEAR;
+        sdt.store_op = SDL_GPU_STOREOP_STORE;      // keep it — we sample it next
+        sdt.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
+        sdt.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+        SDL_GPURenderPass* sp = SDL_BeginGPURenderPass(cmd, nullptr, 0, &sdt);
+        SDL_GPUViewport sv{0, 0, (float)shadow_dim_, (float)shadow_dim_, 0.0f, 1.0f};
+        SDL_SetGPUViewport(sp, &sv);
+        SDL_BindGPUGraphicsPipeline(sp, shadow_pipeline_);
+        for (int ei = 0; ei < (int)scene.entities.size(); ++ei) {
+            const Entity& e = scene.entities[ei];
+            if (!e.visible || e.mesh < 0 || e.mesh >= (int)scene.meshes.size()) continue;
+            const GpuMesh& mesh = scene.meshes[e.mesh];
+            if (!mesh.vbo || !mesh.ibo || mesh.index_count == 0) continue;
+            MeshVertexUBO vubo; vubo.model = scene.world_matrix(ei); vubo.mvp = lightVP * vubo.model;
+            SDL_PushGPUVertexUniformData(cmd, 0, &vubo, sizeof(vubo));
+            SDL_GPUBufferBinding vb{}; vb.buffer = mesh.vbo; SDL_BindGPUVertexBuffers(sp, 0, &vb, 1);
+            SDL_GPUBufferBinding ib{}; ib.buffer = mesh.ibo; SDL_BindGPUIndexBuffer(sp, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+            SDL_DrawGPUIndexedPrimitives(sp, mesh.index_count, 1, 0, 0, 0);
+        }
+        SDL_EndGPURenderPass(sp);
+    }
+
     // ---- Pass 1: 3D scene ----
     SDL_GPUColorTargetInfo color{};
-    color.texture = swap;
+    color.texture = target;
     color.clear_color = SDL_FColor{scene.sky_color.x, scene.sky_color.y, scene.sky_color.z, 1.0f};
     color.load_op = SDL_GPU_LOADOP_CLEAR;
     color.store_op = SDL_GPU_STOREOP_STORE;
@@ -352,7 +512,7 @@ bool Renderer::render(Scene& scene, Camera& cam,
     depth.texture = depth_;
     depth.clear_depth = 1.0f;
     depth.load_op = SDL_GPU_LOADOP_CLEAR;
-    depth.store_op = SDL_GPU_STOREOP_DONT_CARE;
+    depth.store_op = SDL_GPU_STOREOP_STORE;   // keep depth so overlays can occlude
     depth.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
     depth.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
 
@@ -364,6 +524,25 @@ bool Renderer::render(Scene& scene, Camera& cam,
     SDL_Rect gsc{(int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h};
     SDL_SetGPUScissor(pass, &gsc);
     SDL_BindGPUGraphicsPipeline(pass, mesh_pipeline_);
+
+    // Build the punctual-light array once for this frame (shared by every draw).
+    // A light emits along its local -Y axis (identity rotation -> points down).
+    GpuLight frame_lights[kMaxLights];
+    int light_count = 0;
+    for (int li = 0; li < (int)scene.entities.size() && light_count < kMaxLights; ++li) {
+        const Entity& le = scene.entities[li];
+        if (le.kind != InstanceKind::Light || !le.visible) continue;
+        em::mat4 lw = scene.world_matrix(li);
+        em::vec3 lpos{lw.m[3][0], lw.m[3][1], lw.m[3][2]};
+        em::vec3 ldir = em::normalize(em::vec3{-lw.m[1][0], -lw.m[1][1], -lw.m[1][2]});
+        const float D2R = 3.14159265f / 180.0f;
+        GpuLight& g = frame_lights[light_count++];
+        g.position  = em::vec4(lpos, (float)(int)le.light_type);
+        g.direction = em::vec4(ldir, le.light_range);
+        g.color     = em::vec4(le.light_color, le.light_intensity);
+        g.params    = em::vec4{std::cos(le.spot_inner_deg * D2R), std::cos(le.spot_outer_deg * D2R),
+                               le.area_size.x, le.area_size.y};
+    }
 
     for (int ei = 0; ei < (int)scene.entities.size(); ++ei) {
         const Entity& e = scene.entities[ei];
@@ -382,7 +561,19 @@ bool Renderer::render(Scene& scene, Camera& cam,
         fubo.lightDir  = em::vec4(scene.sun_dir, mat && mat->use_texture ? 1.0f : 0.0f);
         fubo.cameraPos = em::vec4(cam.position, 1.0f);
         fubo.params    = {mat ? mat->metalness : 0.0f, mat ? mat->roughness : 0.5f,
-                          mat ? mat->ambient : 0.15f, 0.0f};
+                          (mat && mat->use_mr) ? 1.0f : 0.0f,       // z = sample MR map
+                          (mat && mat->use_normal) ? 1.0f : 0.0f};  // w = sample normal map
+        // World lighting: colored sun + colored ambient fill. Material ambient
+        // acts as a per-material ambient-occlusion multiplier on the world fill.
+        float matAO   = mat ? (mat->ambient / 0.15f) : 1.0f;   // 0.15 == neutral default
+        fubo.sunColor     = em::vec4(scene.sun_color, scene.sun_intensity);
+        fubo.ambientColor = em::vec4(scene.ambient_color, scene.ambient_intensity * matAO);
+        fubo.lightInfo    = em::vec4{(float)light_count, (float)scene.shading_mode, scene.exposure, (float)scene.shadow_samples};
+        for (int k = 0; k < kMaxLights; ++k) fubo.lights[k] = frame_lights[k];
+        fubo.lightVP      = lightVP;
+        fubo.shadowParams = em::vec4{scene.shadow_strength, shadows_on ? 1.0f : 0.0f,
+                                     1.0f / (float)(shadow_dim_ ? shadow_dim_ : 1),
+                                     scene.shadow_soft ? scene.shadow_softness : 0.35f};
         SDL_PushGPUFragmentUniformData(cmd, 0, &fubo, sizeof(fubo));
 
         SDL_GPUBufferBinding vbind{}; vbind.buffer = mesh.vbo;
@@ -390,10 +581,16 @@ bool Renderer::render(Scene& scene, Camera& cam,
         SDL_GPUBufferBinding ibind{}; ibind.buffer = mesh.ibo;
         SDL_BindGPUIndexBuffer(pass, &ibind, SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
-        SDL_GPUTextureSamplerBinding tex{};
-        tex.texture = (mat && mat->tex) ? mat->tex : white_;
-        tex.sampler = sampler_;
-        SDL_BindGPUFragmentSamplers(pass, 0, &tex, 1);
+        SDL_GPUTextureSamplerBinding tex[4]{};
+        tex[0].texture = (mat && mat->tex) ? mat->tex : white_;             // albedo
+        tex[0].sampler = sampler_;
+        tex[1].texture = shadow_map_ ? shadow_map_ : white_;               // shadow
+        tex[1].sampler = sampler_;
+        tex[2].texture = (mat && mat->tex_mr) ? mat->tex_mr : white_;      // metal-rough
+        tex[2].sampler = sampler_;
+        tex[3].texture = (mat && mat->tex_normal) ? mat->tex_normal : white_; // normal
+        tex[3].sampler = sampler_;
+        SDL_BindGPUFragmentSamplers(pass, 0, tex, 4);
 
         SDL_DrawGPUIndexedPrimitives(pass, mesh.index_count, 1, 0, 0, 0);
     }
@@ -434,7 +631,7 @@ bool Renderer::render(Scene& scene, Camera& cam,
 
         // (b) edge-detect the mask and composite the outline on screen.
         SDL_GPUColorTargetInfo oc{};
-        oc.texture = swap; oc.load_op = SDL_GPU_LOADOP_LOAD; oc.store_op = SDL_GPU_STOREOP_STORE;
+        oc.texture = target; oc.load_op = SDL_GPU_LOADOP_LOAD; oc.store_op = SDL_GPU_STOREOP_STORE;
         SDL_GPURenderPass* opass = SDL_BeginGPURenderPass(cmd, &oc, 1, nullptr);
         SDL_Rect osc{(int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h};
         SDL_SetGPUScissor(opass, &osc);
@@ -456,9 +653,16 @@ bool Renderer::render(Scene& scene, Camera& cam,
         for (const Entity& ce : scene.entities)
             if (ce.collider != ColliderType::None) { any = true; break; }
         if (any) {
+            // Pick X-ray (always-on-top, no depth) or depth-tested (occluded by geometry).
+            SDL_GPUGraphicsPipeline* pipe_fill = colliders_xray ? collider_fill_pipeline_ : collider_fill_depth_;
+            SDL_GPUGraphicsPipeline* pipe_line = colliders_xray ? collider_line_pipeline_ : collider_line_depth_;
+            SDL_GPUGraphicsPipeline* pipe_edge = colliders_xray ? collider_edge_pipeline_ : collider_edge_depth_;
             SDL_GPUColorTargetInfo cc{};
-            cc.texture = swap; cc.load_op = SDL_GPU_LOADOP_LOAD; cc.store_op = SDL_GPU_STOREOP_STORE;
-            SDL_GPURenderPass* cpass = SDL_BeginGPURenderPass(cmd, &cc, 1, nullptr);
+            cc.texture = target; cc.load_op = SDL_GPU_LOADOP_LOAD; cc.store_op = SDL_GPU_STOREOP_STORE;
+            SDL_GPUDepthStencilTargetInfo cd{};
+            cd.texture = depth_; cd.load_op = SDL_GPU_LOADOP_LOAD; cd.store_op = SDL_GPU_STOREOP_DONT_CARE;
+            cd.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE; cd.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
+            SDL_GPURenderPass* cpass = SDL_BeginGPURenderPass(cmd, &cc, 1, colliders_xray ? nullptr : &cd);
             SDL_GPUViewport cvp{vp_x, vp_y, vp_w, vp_h, 0.0f, 1.0f};
             SDL_SetGPUViewport(cpass, &cvp);
             SDL_Rect csc{(int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h};
@@ -499,18 +703,18 @@ bool Renderer::render(Scene& scene, Camera& cam,
                 const em::quat noq{0, 0, 0, 1};
                 if (ce.collider == ColliderType::Box) {
                     em::mat4 m = base * em::compose(cen, noq, ext);
-                    draw(collider_fill_pipeline_, collider_cube_, m, 0.12f);     // faint faces
-                    draw(collider_edge_pipeline_, collider_box_edges_, m, 0.9f); // clean 12 edges
+                    draw(pipe_fill, collider_cube_, m, 0.12f);     // faint faces
+                    draw(pipe_edge, collider_box_edges_, m, 0.9f); // clean 12 edges
                 } else if (ce.collider == ColliderType::Sphere || ce.collider == ColliderType::Capsule) {
                     float r = ext.x * 0.5f;
                     if (ext.y * 0.5f > r) r = ext.y * 0.5f;
                     if (ext.z * 0.5f > r) r = ext.z * 0.5f;
                     // three great-circle rings fake a sphere without triangle soup
-                    draw(collider_edge_pipeline_, collider_ring_, base * g_model({r,0,0},{0,r,0},{0,0,r}, cen, 1.0f), 0.9f); // XY
-                    draw(collider_edge_pipeline_, collider_ring_, base * g_model({0,r,0},{0,0,r},{r,0,0}, cen, 1.0f), 0.9f); // YZ
-                    draw(collider_edge_pipeline_, collider_ring_, base * g_model({r,0,0},{0,0,r},{0,r,0}, cen, 1.0f), 0.9f); // XZ
+                    draw(pipe_edge, collider_ring_, base * g_model({r,0,0},{0,r,0},{0,0,r}, cen, 1.0f), 0.9f); // XY
+                    draw(pipe_edge, collider_ring_, base * g_model({0,r,0},{0,0,r},{r,0,0}, cen, 1.0f), 0.9f); // YZ
+                    draw(pipe_edge, collider_ring_, base * g_model({r,0,0},{0,0,r},{0,r,0}, cen, 1.0f), 0.9f); // XZ
                 } else {   // Convex: show the actual mesh as a wireframe hull
-                    draw(collider_line_pipeline_, mm, base, 0.7f);
+                    draw(pipe_line, mm, base, 0.7f);
                 }
             }
             SDL_EndGPURenderPass(cpass);
@@ -523,7 +727,7 @@ bool Renderer::render(Scene& scene, Camera& cam,
         for (const Entity& e : scene.entities) if (e.kind == InstanceKind::Camera) { anyc = true; break; }
         if (anyc) {
             SDL_GPUColorTargetInfo fc{};
-            fc.texture = swap; fc.load_op = SDL_GPU_LOADOP_LOAD; fc.store_op = SDL_GPU_STOREOP_STORE;
+            fc.texture = target; fc.load_op = SDL_GPU_LOADOP_LOAD; fc.store_op = SDL_GPU_STOREOP_STORE;
             SDL_GPURenderPass* fp = SDL_BeginGPURenderPass(cmd, &fc, 1, nullptr);
             SDL_GPUViewport fv{vp_x, vp_y, vp_w, vp_h, 0.0f, 1.0f}; SDL_SetGPUViewport(fp, &fv);
             SDL_Rect fsc{(int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h}; SDL_SetGPUScissor(fp, &fsc);
@@ -548,6 +752,67 @@ bool Renderer::render(Scene& scene, Camera& cam,
         }
     }
 
+    // ---- light visuals (wireframe marker so Light instances are visible) ----
+    if (collider_edge_pipeline_ && collider_ring_.vbo) {
+        bool anyl = false;
+        for (const Entity& e : scene.entities) if (e.kind == InstanceKind::Light && e.visible) { anyl = true; break; }
+        if (anyl) {
+            SDL_GPUColorTargetInfo lc{};
+            lc.texture = target; lc.load_op = SDL_GPU_LOADOP_LOAD; lc.store_op = SDL_GPU_STOREOP_STORE;
+            SDL_GPURenderPass* lp = SDL_BeginGPURenderPass(cmd, &lc, 1, nullptr);
+            SDL_GPUViewport lv{vp_x, vp_y, vp_w, vp_h, 0.0f, 1.0f}; SDL_SetGPUViewport(lp, &lv);
+            SDL_Rect lsc{(int)vp_x, (int)vp_y, (int)vp_w, (int)vp_h}; SDL_SetGPUScissor(lp, &lsc);
+            SDL_BindGPUGraphicsPipeline(lp, collider_edge_pipeline_);
+            // Draw one wireframe gizmo mesh with a given model matrix + color.
+            auto draw_gizmo = [&](const GpuMesh& gm, const em::mat4& model, em::vec4 col) {
+                if (!gm.vbo || !gm.ibo) return;
+                MeshVertexUBO vubo; vubo.model = model; vubo.mvp = proj * view * model;
+                SDL_PushGPUVertexUniformData(cmd, 0, &vubo, sizeof(vubo));
+                MeshFragUBO fubo{};              // defaults -> Phong, no lights, exposure 1
+                fubo.baseColor = col;
+                fubo.lightDir = em::vec4(scene.sun_dir, 0.0f);
+                fubo.cameraPos = em::vec4(cam.position, 1.0f);
+                fubo.params = {0.0f, 0.5f, 1.0f, 0.0f};
+                SDL_PushGPUFragmentUniformData(cmd, 0, &fubo, sizeof(fubo));
+                SDL_GPUBufferBinding vb{}; vb.buffer = gm.vbo; SDL_BindGPUVertexBuffers(lp, 0, &vb, 1);
+                SDL_GPUBufferBinding ib{}; ib.buffer = gm.ibo; SDL_BindGPUIndexBuffer(lp, &ib, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+                SDL_GPUTextureSamplerBinding tx{}; tx.texture = white_; tx.sampler = sampler_; SDL_BindGPUFragmentSamplers(lp, 0, &tx, 1);
+                SDL_DrawGPUIndexedPrimitives(lp, gm.index_count, 1, 0, 0, 0);
+            };
+            const em::quat rings[3] = { em::quat{0, 0, 0, 1},
+                                        em::quat::from_euler(1.5708f, 0, 0),
+                                        em::quat::from_euler(0, 1.5708f, 0) };
+            const em::quat qid{0, 0, 0, 1};
+            for (int li = 0; li < (int)scene.entities.size(); ++li) {
+                const Entity& e = scene.entities[li];
+                if (e.kind != InstanceKind::Light || !e.visible) continue;
+                em::mat4 wm = scene.world_matrix(li);
+                em::vec3 lpos{wm.m[3][0], wm.m[3][1], wm.m[3][2]};
+                em::vec3 c = e.light_color;
+                float mx = std::max(std::max(c.x, c.y), std::max(c.z, 0.35f));
+                em::vec4 col{c.x / mx, c.y / mx, c.z / mx, 1.0f};   // normalize -> bright marker
+                switch (e.light_type) {
+                    case LightType::Point:
+                        for (int r = 0; r < 3; ++r)
+                            draw_gizmo(collider_ring_, em::compose(lpos, rings[r], {0.35f, 0.35f, 0.35f}), col);
+                        break;
+                    case LightType::Spot: {
+                        float L = std::max(1.5f, std::min(e.light_range, 6.0f));
+                        float rad = std::tan(e.spot_outer_deg * 3.14159265f / 180.0f) * L;
+                        draw_gizmo(light_cone_, wm * em::compose({0, 0, 0}, qid, {rad, L, rad}), col);
+                    } break;
+                    case LightType::Directional:
+                        draw_gizmo(light_dir_, wm * em::compose({0, 0, 0}, qid, {1.3f, 1.3f, 1.3f}), col);
+                        break;
+                    case LightType::Area:
+                        draw_gizmo(light_quad_, wm * em::compose({0, 0, 0}, qid, {std::max(0.1f, e.area_size.x), 1.0f, std::max(0.1f, e.area_size.y)}), col);
+                        break;
+                }
+            }
+            SDL_EndGPURenderPass(lp);
+        }
+    }
+
     // ---- 3D transform gizmo (always-on-top handles, screen-constant size) ----
     if (selected >= 0 && selected < (int)scene.entities.size() && gizmo_pipeline_ &&
         gizmo_mode >= 0 && gizmo_mode <= 2) {
@@ -563,7 +828,7 @@ bool Renderer::render(Scene& scene, Camera& cam,
                           : (gizmo_mode == 2) ? gizmo_scale_ : gizmo_arrow_;
 
         SDL_GPUColorTargetInfo gc{};
-        gc.texture = swap; gc.load_op = SDL_GPU_LOADOP_LOAD; gc.store_op = SDL_GPU_STOREOP_STORE;
+        gc.texture = target; gc.load_op = SDL_GPU_LOADOP_LOAD; gc.store_op = SDL_GPU_STOREOP_STORE;
         SDL_GPUDepthStencilTargetInfo gd{};
         gd.texture = depth_; gd.clear_depth = 1.0f;
         gd.load_op = SDL_GPU_LOADOP_CLEAR; gd.store_op = SDL_GPU_STOREOP_DONT_CARE;
@@ -595,7 +860,7 @@ bool Renderer::render(Scene& scene, Camera& cam,
                 }
                 MeshVertexUBO vubo; vubo.model = model; vubo.mvp = proj * view * model;
                 SDL_PushGPUVertexUniformData(cmd, 0, &vubo, sizeof(vubo));
-                bool hot = (gizmo_mode == 1) ? (gizmo_hot == 3) : (gizmo_hot == k);
+                bool hot = (gizmo_hot == k);   // per-axis highlight for all modes
                 em::vec3 col = hot ? em::vec3{1.0f, 0.92f, 0.20f} : axcol[k];
                 MeshFragUBO fubo{};
                 fubo.baseColor = em::vec4(col, 1.0f);
@@ -617,12 +882,51 @@ bool Renderer::render(Scene& scene, Camera& cam,
 
     // ---- Pass 2: UI overlay (color only, no depth) ----
     SDL_GPUColorTargetInfo ui_color{};
-    ui_color.texture = swap;
+    ui_color.texture = target;
     ui_color.load_op = SDL_GPU_LOADOP_LOAD;
     ui_color.store_op = SDL_GPU_STOREOP_STORE;
     SDL_GPURenderPass* ui_pass = SDL_BeginGPURenderPass(cmd, &ui_color, 1, nullptr);
     ui.render(cmd, ui_pass, (int)w, (int)h);
     SDL_EndGPURenderPass(ui_pass);
+
+    // ---- optional in-engine screenshot: blit the offscreen frame to the window,
+    //      then download it + write a PNG (no external capture tool needed) ----
+    if (capturing) {
+        SDL_GPUBlitInfo bi{};
+        bi.source.texture = capture_tex_; bi.source.w = w; bi.source.h = h;
+        bi.destination.texture = swap; bi.destination.w = w; bi.destination.h = h;
+        bi.load_op = SDL_GPU_LOADOP_DONT_CARE;
+        bi.filter = SDL_GPU_FILTER_NEAREST;
+        SDL_BlitGPUTexture(cmd, &bi);
+
+        const uint32_t bytes = w * h * 4;
+        SDL_GPUTransferBufferCreateInfo tbi{};
+        tbi.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD; tbi.size = bytes;
+        SDL_GPUTransferBuffer* tb = SDL_CreateGPUTransferBuffer(dev_, &tbi);
+        SDL_GPUCopyPass* cp = SDL_BeginGPUCopyPass(cmd);
+        SDL_GPUTextureRegion src{}; src.texture = target; src.w = w; src.h = h; src.d = 1;
+        SDL_GPUTextureTransferInfo dst{}; dst.transfer_buffer = tb; dst.offset = 0;
+        dst.pixels_per_row = w; dst.rows_per_layer = h;
+        SDL_DownloadFromGPUTexture(cp, &src, &dst);
+        SDL_EndGPUCopyPass(cp);
+        SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+        SDL_WaitForGPUFences(dev_, true, &fence, 1);
+        SDL_ReleaseGPUFence(dev_, fence);
+        if (void* map = SDL_MapGPUTransferBuffer(dev_, tb, false)) {
+            std::vector<uint8_t> px(bytes);
+            std::memcpy(px.data(), map, bytes);
+            SDL_UnmapGPUTransferBuffer(dev_, tb);
+            // swapchain is B8G8R8A8 (format 12) -> swap R/B and force opaque alpha
+            for (uint32_t i = 0; i < bytes; i += 4) { std::swap(px[i], px[i + 2]); px[i + 3] = 255; }
+            if (stbi_write_png(screenshot_path_.c_str(), (int)w, (int)h, 4, px.data(), (int)w * 4))
+                println("[screenshot] wrote %s (%ux%u)", screenshot_path_.c_str(), w, h);
+            else
+                warnln("[screenshot] failed to write %s", screenshot_path_.c_str());
+        }
+        SDL_ReleaseGPUTransferBuffer(dev_, tb);
+        screenshot_path_.clear();
+        return true;   // already submitted with a fence above
+    }
 
     SDL_SubmitGPUCommandBuffer(cmd);
     return true;

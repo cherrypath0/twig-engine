@@ -43,6 +43,7 @@ private:
     void spawn_primitive(int kind);          // 0 cube, 1 sphere, 2 plane
     void spawn_instance(int kind);           // InstanceKind: Empty/Renderable/RigidBody/StaticCollider
     void instantiate_model(const std::string& path);
+    void import_dropped_file(const std::string& src);   // drag & drop from the file manager
     std::string material_for_primitive(const Primitive& prim);  // GLB base color -> material
     void save_scene(const std::string& path);
     void load_scene(const std::string& path);

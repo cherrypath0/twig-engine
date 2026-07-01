@@ -176,4 +176,17 @@ inline mat4 ortho(float left, float right, float bottom, float top) {
     return r;
 }
 
+// Right-handed orthographic with an explicit depth range, mapping view-space
+// z in [-near, -far] to clip z in [0, 1] (Vulkan-style). Used for shadow maps.
+inline mat4 ortho(float left, float right, float bottom, float top, float znear, float zfar) {
+    mat4 r = mat4::identity();
+    r.m[0][0] = 2.0f / (right - left);
+    r.m[1][1] = 2.0f / (top - bottom);
+    r.m[2][2] = -1.0f / (zfar - znear);
+    r.m[3][0] = -(right + left) / (right - left);
+    r.m[3][1] = -(top + bottom) / (top - bottom);
+    r.m[3][2] = -znear / (zfar - znear);
+    return r;
+}
+
 } // namespace em

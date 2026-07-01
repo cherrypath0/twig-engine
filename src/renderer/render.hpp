@@ -28,7 +28,12 @@ public:
                 NuklearBackend& ui,
                 float vp_x, float vp_y, float vp_w, float vp_h,
                 int selected, int gizmo_mode, bool gizmo_local, int gizmo_hot, bool show_colliders,
-                const std::vector<int>& highlight);
+                bool colliders_xray, const std::vector<int>& highlight);
+
+    // Request a PNG dump of the final rendered frame. The next render() honors
+    // it (downloads the swapchain image + writes the file), so verification does
+    // not depend on any external window-capture tool.
+    void request_screenshot(const std::string& path) { screenshot_path_ = path; }
 
     SDL_GPUDevice*  device() const { return dev_; }
     uint32_t        swapchain_format() const { return swap_fmt_; }
@@ -42,6 +47,9 @@ private:
     SDL_GPUDevice*  dev_    = nullptr;
     SDL_Window*     window_ = nullptr;
     SDL_GPUGraphicsPipeline* mesh_pipeline_ = nullptr;
+    SDL_GPUGraphicsPipeline* shadow_pipeline_ = nullptr;        // sun depth pass
+    SDL_GPUTexture* shadow_map_ = nullptr;                      // directional shadow depth
+    uint32_t shadow_dim_ = 0;
     SDL_GPUGraphicsPipeline* mask_pipeline_ = nullptr;          // selected -> silhouette mask
     SDL_GPUGraphicsPipeline* outline_post_pipeline_ = nullptr;  // mask -> screen-space outline
     SDL_GPUTexture* mask_   = nullptr;
@@ -55,13 +63,23 @@ private:
     SDL_GPUGraphicsPipeline* collider_fill_pipeline_ = nullptr;   // triangles, faint faces
     SDL_GPUGraphicsPipeline* collider_line_pipeline_ = nullptr;   // FILLMODE_LINE (convex mesh)
     SDL_GPUGraphicsPipeline* collider_edge_pipeline_ = nullptr;   // LINELIST (box edges / rings)
+    // Depth-tested variants (occluded by scene geometry instead of X-ray on-top).
+    SDL_GPUGraphicsPipeline* collider_fill_depth_ = nullptr;
+    SDL_GPUGraphicsPipeline* collider_line_depth_ = nullptr;
+    SDL_GPUGraphicsPipeline* collider_edge_depth_ = nullptr;
     GpuMesh collider_cube_{};        // unit cube (faint faces)
     GpuMesh collider_box_edges_{};   // unit cube, 12 edges as a line list
     GpuMesh collider_ring_{};        // unit circle (line list) for sphere/capsule
     GpuMesh gizmo_frustum_{};        // camera frustum wireframe (line list)
+    GpuMesh light_cone_{};           // spot light gizmo
+    GpuMesh light_dir_{};            // directional light gizmo
+    GpuMesh light_quad_{};           // area light gizmo
     SDL_GPUTexture* depth_  = nullptr;
     SDL_GPUTexture* white_  = nullptr;
     SDL_GPUSampler* sampler_ = nullptr;
     uint32_t depth_w_ = 0, depth_h_ = 0;
     uint32_t swap_fmt_ = 0;
+    std::string screenshot_path_;   // pending in-engine screenshot (empty = none)
+    SDL_GPUTexture* capture_tex_ = nullptr;   // offscreen target for screenshots
+    uint32_t cap_w_ = 0, cap_h_ = 0;
 };

@@ -102,6 +102,11 @@ void Engine::build_default_scene() {
     sphere_mesh_ = add_mesh(model::make_sphere(0.5f, 24));
     plane_mesh_  = add_mesh(model::make_plane(20.0f, 20.0f));
 
+    // The World node is a singleton environment instance shown at the top of
+    // the outliner; selecting it opens the environment/lighting controls.
+    Entity world; world.name = "World"; world.kind = InstanceKind::World; world.mesh = -1;
+    scene_.add_entity(world);
+
     Entity floor;
     floor.name = "floor";
     floor.mesh = plane_mesh_;
@@ -206,6 +211,16 @@ void Engine::save_scene(const std::string& path) {
     std::ofstream f(path);
     if (!f) { editor_.log("[scene] save failed: " + path); return; }
     f << "twigscene 1\n";
+    // world lighting block
+    f << "sundir " << scene_.sun_dir.x << ' ' << scene_.sun_dir.y << ' ' << scene_.sun_dir.z << "\n";
+    f << "sky "    << scene_.sky_color.x << ' ' << scene_.sky_color.y << ' ' << scene_.sky_color.z << "\n";
+    f << "suncol " << scene_.sun_color.x << ' ' << scene_.sun_color.y << ' ' << scene_.sun_color.z << ' ' << scene_.sun_intensity << "\n";
+    f << "ambcol " << scene_.ambient_color.x << ' ' << scene_.ambient_color.y << ' ' << scene_.ambient_color.z << ' ' << scene_.ambient_intensity << "\n";
+    f << "shade "  << scene_.shading_mode << ' ' << scene_.exposure << "\n";
+    f << "shadow " << (scene_.sun_shadows ? 1 : 0) << ' ' << scene_.shadow_strength
+      << ' ' << (scene_.shadow_soft ? 1 : 0) << ' ' << scene_.shadow_softness
+      << ' ' << scene_.shadow_samples << "\n";
+    if (!scene_.hdri_path.empty()) f << "hdri " << scene_.hdri_path << "\n";
     for (const Entity& e : scene_.entities) {
         std::string src = "none";
         if (e.mesh == cube_mesh_) src = "cube";
@@ -220,6 +235,15 @@ void Engine::save_scene(const std::string& path) {
         f << "par " << e.parent << "\n";
         f << "mat " << e.material << "\nkind " << (int)e.kind << "\ncol " << (int)e.collider
           << "\nfov " << e.fov << "\nvis " << (e.visible ? 1 : 0) << "\n";
+        if (e.lock_children) f << "lock 1\n";
+        if (e.kind == InstanceKind::Light) {
+            f << "light " << (int)e.light_type << ' '
+              << e.light_color.x << ' ' << e.light_color.y << ' ' << e.light_color.z << ' '
+              << e.light_intensity << ' ' << e.light_range << ' '
+              << e.spot_inner_deg << ' ' << e.spot_outer_deg << ' '
+              << e.area_size.x << ' ' << e.area_size.y << ' '
+              << (e.cast_shadows ? 1 : 0) << "\n";
+        }
         if (!e.script.empty()) f << "script " << e.script << "\n";
         f << "end\n";
     }
@@ -241,7 +265,19 @@ void Engine::load_scene(const std::string& path) {
     std::string line, mesh_src = "none"; Entity cur; bool in_e = false;
     while (std::getline(f, line)) {
         std::istringstream ls(line); std::string key; ls >> key;
-        if (key == "entity") { cur = Entity{}; in_e = true; mesh_src = "none"; }
+        if (key == "sundir") { ls >> scene_.sun_dir.x >> scene_.sun_dir.y >> scene_.sun_dir.z; }
+        else if (key == "sky") { ls >> scene_.sky_color.x >> scene_.sky_color.y >> scene_.sky_color.z; }
+        else if (key == "suncol") { ls >> scene_.sun_color.x >> scene_.sun_color.y >> scene_.sun_color.z >> scene_.sun_intensity; }
+        else if (key == "ambcol") { ls >> scene_.ambient_color.x >> scene_.ambient_color.y >> scene_.ambient_color.z >> scene_.ambient_intensity; }
+        else if (key == "shade") { ls >> scene_.shading_mode >> scene_.exposure; }
+        else if (key == "shadow") {
+            int s = 1; ls >> s >> scene_.shadow_strength; scene_.sun_shadows = (s != 0);
+            int sf = 1; if (ls >> sf) scene_.shadow_soft = (sf != 0);   // optional (newer files)
+            float soft = 0.0f; if (ls >> soft) scene_.shadow_softness = soft;
+            int sm = 0; if (ls >> sm) scene_.shadow_samples = sm;
+        }
+        else if (key == "hdri") { std::getline(ls >> std::ws, scene_.hdri_path); }
+        else if (key == "entity") { cur = Entity{}; in_e = true; mesh_src = "none"; }
         else if (key == "name") { std::getline(ls >> std::ws, cur.name); }
         else if (key == "mesh") { std::getline(ls >> std::ws, mesh_src); }
         else if (key == "pos") { ls >> cur.transform.position.x >> cur.transform.position.y >> cur.transform.position.z; }
@@ -253,6 +289,15 @@ void Engine::load_scene(const std::string& path) {
         else if (key == "col") { int c = 0; ls >> c; cur.collider = (ColliderType)c; }
         else if (key == "fov") { ls >> cur.fov; }
         else if (key == "vis") { int v = 1; ls >> v; cur.visible = (v != 0); }
+        else if (key == "lock") { int l = 0; ls >> l; cur.lock_children = (l != 0); }
+        else if (key == "light") {
+            int lt = 0; ls >> lt; cur.light_type = (LightType)lt;
+            ls >> cur.light_color.x >> cur.light_color.y >> cur.light_color.z
+               >> cur.light_intensity >> cur.light_range
+               >> cur.spot_inner_deg >> cur.spot_outer_deg
+               >> cur.area_size.x >> cur.area_size.y;
+            int cs = 1; if (ls >> cs) cur.cast_shadows = (cs != 0);   // optional (newer files)
+        }
         else if (key == "script") { ls >> cur.script; }
         else if (key == "end" && in_e) {
             if (mesh_src == "cube") cur.mesh = cube_mesh_;
@@ -275,6 +320,14 @@ void Engine::load_scene(const std::string& path) {
             scene_.add_entity(cur); in_e = false;
         }
     }
+    // Guarantee a World node exists (older scenes predate it).
+    bool has_world = false;
+    for (const Entity& e : scene_.entities) if (e.kind == InstanceKind::World) { has_world = true; break; }
+    if (!has_world) {
+        Entity world; world.name = "World"; world.kind = InstanceKind::World; world.mesh = -1;
+        scene_.entities.insert(scene_.entities.begin(), world);
+        for (Entity& e : scene_.entities) if (e.parent >= 0) e.parent += 1;  // fix up indices
+    }
     physics_.optimize();
     editor_.set_selected(-1);
     editor_.log("[scene] loaded " + path);
@@ -294,7 +347,13 @@ void Engine::handle_input(float dt) {
     while (SDL_PollEvent(&e)) {
         ui_.handle_event(e);
         switch (e.type) {
-            case SDL_EVENT_QUIT: running_ = false; break;
+            case SDL_EVENT_QUIT:
+                if (editor_.is_dirty()) editor_.show_save_prompt();  // ask before losing changes
+                else running_ = false;
+                break;
+            case SDL_EVENT_DROP_FILE:
+                if (e.drop.data) import_dropped_file(e.drop.data);
+                break;
             case SDL_EVENT_MOUSE_MOTION:
                 if (mouse_look_) { look_dx_ += e.motion.xrel; look_dy_ += e.motion.yrel; }
                 break;
@@ -330,6 +389,7 @@ void Engine::handle_input(float dt) {
             case SDL_EVENT_KEY_DOWN:
                 if (e.key.key == SDLK_S && (e.key.mod & SDL_KMOD_CTRL) && !editor_.editor_open()) {
                     save_scene(scene_path());
+                    editor_.note_saved();
                 }
                 if (e.key.key == SDLK_ESCAPE) {
                     // Esc no longer quits: leave fly-cam, else clear the selection.
@@ -405,6 +465,7 @@ void Engine::update_gizmo() {
                                vp_x_, vp_y_, vp_w_, vp_h_, ldown && !mouse_look_, mxf, myf);
     }
     gizmo_active_ = gz.active;
+    if (gz.active) editor_.mark_dirty();   // dragging a handle changes the scene
     gizmo_hot_ = gz.axis;
     if (gz.clone) clone_selected();   // Shift+gizmo-drag duplicates; the drag moves the copy
 
@@ -467,9 +528,34 @@ void Engine::pick_entity(float mx, float my) {
             if (wd < best) { best = wd; hit = i; }
         }
     }
+    // Mesh-less instances (lights, cameras, empties) have no geometry, so pick
+    // them by proximity of the ray to their world origin using a screen-constant
+    // disc radius. This is what makes lights clickable in the viewport.
+    for (int i = 0; i < (int)scene_.entities.size(); ++i) {
+        const Entity& e = scene_.entities[i];
+        if (e.has_mesh() || e.kind == InstanceKind::World) continue;
+        em::mat4 model = scene_.world_matrix(i);
+        em::vec3 p{model.m[3][0], model.m[3][1], model.m[3][2]};
+        em::vec3 op{p.x - r.origin.x, p.y - r.origin.y, p.z - r.origin.z};
+        float t = op.x * r.dir.x + op.y * r.dir.y + op.z * r.dir.z;
+        if (t <= 0.0f) continue;
+        em::vec3 cp{r.origin.x + r.dir.x * t, r.origin.y + r.dir.y * t, r.origin.z + r.dir.z * t};
+        float dx = p.x - cp.x, dy = p.y - cp.y, dz = p.z - cp.z;
+        float perp = std::sqrt(dx * dx + dy * dy + dz * dz);
+        if (perp < t * 0.06f && t < best) { best = t; hit = i; }   // ~screen-constant disc
+    }
+    // Locked-parent redirect: if any ancestor of the hit entity has lock_children
+    // set, select the TOPMOST such ancestor instead (so a group behaves as one).
+    if (hit >= 0) {
+        int redirect = -1;
+        for (int p = scene_.entities[hit].parent, guard = 0; p >= 0 && guard++ < 64; p = scene_.entities[p].parent)
+            if (scene_.entities[p].lock_children) redirect = p;
+        if (redirect >= 0) hit = redirect;
+    }
     const bool* ks = SDL_GetKeyboardState(nullptr);
-    bool ctrl = ks && (ks[SDL_SCANCODE_LCTRL] || ks[SDL_SCANCODE_RCTRL]);
-    if (hit >= 0) { if (ctrl) editor_.toggle_select(hit); else editor_.set_selected(hit); editor_.log("[pick] " + scene_.entities[hit].name); }
+    bool add = ks && (ks[SDL_SCANCODE_LCTRL] || ks[SDL_SCANCODE_RCTRL] ||
+                      ks[SDL_SCANCODE_LSHIFT] || ks[SDL_SCANCODE_RSHIFT]);   // Ctrl/Shift = multi
+    if (hit >= 0) { if (add) editor_.toggle_select(hit); else editor_.set_selected(hit); editor_.log("[pick] " + scene_.entities[hit].name); }
     else          { editor_.set_selected(-1); }
 }
 
@@ -525,6 +611,15 @@ void Engine::spawn_instance(int kind) {
             e.name = "camera_" + std::to_string(scene_.entities.size());
             e.mesh = -1; e.fov = 60.0f;
             break;
+        case InstanceKind::Light:
+            e.name = "light_" + std::to_string(scene_.entities.size());
+            e.mesh = -1;
+            e.light_type = LightType::Point;
+            break;
+        case InstanceKind::World:
+            e.name = "World";
+            e.mesh = -1;
+            break;
     }
     scene_.add_entity(e);
     physics_.optimize();
@@ -551,7 +646,8 @@ std::string Engine::material_for_primitive(const Primitive& prim) {
         Material m;
         m.name = k;
         m.color_tint = c;
-        m.roughness = 0.7f;
+        m.metalness = prim.metalness;
+        m.roughness = prim.roughness > 0.0f ? prim.roughness : 0.7f;
         if (!prim.tex_rgba.empty()) {
             m.tex = gpu::create_texture_rgba(gpu_, prim.tex_rgba.data(),
                                              (uint32_t)prim.tex_w, (uint32_t)prim.tex_h, k.c_str());
@@ -560,9 +656,53 @@ std::string Engine::material_for_primitive(const Primitive& prim) {
         } else {
             material::resolve_gpu(gpu_, m, renderer_.white());
         }
+        // Metallic-roughness map: without it, the glTF default factors (1,1) make
+        // every surface fully metallic -> diffuse vanishes and the albedo texture
+        // never shows. Sampling the MR map restores the authored metal/rough.
+        if (!prim.mr_rgba.empty()) {
+            m.tex_mr = gpu::create_texture_rgba(gpu_, prim.mr_rgba.data(),
+                                                (uint32_t)prim.mr_w, (uint32_t)prim.mr_h, (k + "_mr").c_str());
+            m.use_mr = (m.tex_mr != nullptr);
+        }
+        if (!prim.nrm_rgba.empty()) {
+            m.tex_normal = gpu::create_texture_rgba(gpu_, prim.nrm_rgba.data(),
+                                                    (uint32_t)prim.nrm_w, (uint32_t)prim.nrm_h, (k + "_n").c_str());
+            m.use_normal = (m.tex_normal != nullptr);
+        }
+        // No MR map + default glTF factors (fully metallic, fully rough) almost
+        // always means the author expected a map: fall back to a sane dielectric.
+        if (!m.use_mr && m.metalness >= 0.999f && m.roughness >= 0.999f) {
+            m.metalness = 0.0f; m.roughness = 0.9f;
+        }
+        devprintln("[mat] %s albedo=%d mr=%d normal=%d", k.c_str(),
+                   (int)m.use_texture, (int)m.use_mr, (int)m.use_normal);
         materials_[k] = m;
     }
     return k;
+}
+
+void Engine::import_dropped_file(const std::string& src) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (!fs::exists(src, ec)) { editor_.log("[import] not found: " + src); return; }
+    std::string ext = fs::path(src).extension().string();
+    std::string lext; for (char c : ext) lext += (char)std::tolower((unsigned char)c);
+    std::string dstdir;
+    bool is_model = (lext == ".glb" || lext == ".gltf");
+    if (is_model)                     dstdir = project_.dir_models();
+    else if (lext == ".tgmat")        dstdir = project_.dir_materials();
+    else if (lext == ".png" || lext == ".jpg" || lext == ".jpeg" || lext == ".hdr" ||
+             lext == ".exr" || lext == ".tga" || lext == ".bmp")
+                                      dstdir = project_.root() + "/assets/textures";
+    else if (lext == ".cpp" || lext == ".hpp") dstdir = project_.dir_scripts();
+    else { editor_.log("[import] unsupported type: " + lext); return; }
+    fs::create_directories(dstdir, ec);
+    fs::path dst = fs::path(dstdir) / fs::path(src).filename();
+    fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
+    if (ec) { editor_.log("[import] copy failed: " + ec.message()); return; }
+    project_.refresh();
+    editor_.log("[import] " + fs::path(src).filename().string() + " -> " + dstdir);
+    if (is_model) instantiate_model(dst.string());   // drop a model -> spawn it right away
 }
 
 void Engine::instantiate_model(const std::string& path) {
@@ -715,17 +855,51 @@ void Engine::set_kind(int kind) {
 // Remove an entity (and its physics body) by index, fixing up the selection.
 void Engine::delete_entity(int index) {
     if (index < 0 || index >= (int)scene_.entities.size()) return;
-    Entity& e = scene_.entities[index];
-    if (e.body.valid()) { physics_.remove_body(e.body); e.body = PhysicsBody{}; }
-    editor_.log("[scene] deleted " + e.name);
-    scene_.entities.erase(scene_.entities.begin() + index);
-    // NOTE: scene_.meshes / mesh_cpu_ are intentionally NOT compacted so other
-    // entities' mesh indices stay valid (the GPU buffer is freed at shutdown).
-    editor_.set_selected(-1);
+    editor_.set_selected(index);
+    delete_selected();
 }
 
+// Delete the whole current selection PLUS every descendant of each selected
+// node, then remap the survivors' parent indices so the hierarchy stays intact.
+// (Erasing without remapping was corrupting parents -> the wrong rows appeared
+// to vanish.) The World node is never deletable.
 void Engine::delete_selected() {
-    delete_entity(editor_.selected());
+    std::vector<int> sel = editor_.selection();
+    if (sel.empty() && editor_.selected() >= 0) sel.push_back(editor_.selected());
+    if (sel.empty()) return;
+
+    const int n = (int)scene_.entities.size();
+    std::vector<char> kill(n, 0);
+    for (int s : sel) if (s >= 0 && s < n) kill[s] = 1;
+    // expand to all descendants
+    for (bool changed = true; changed; ) {
+        changed = false;
+        for (int i = 0; i < n; ++i) {
+            int p = scene_.entities[i].parent;
+            if (!kill[i] && p >= 0 && p < n && kill[p]) { kill[i] = 1; changed = true; }
+        }
+    }
+    // never delete the singleton World node
+    for (int i = 0; i < n; ++i)
+        if (kill[i] && scene_.entities[i].kind == InstanceKind::World) kill[i] = 0;
+
+    std::vector<int> remap(n, -1);
+    std::vector<Entity> keep;
+    keep.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        if (kill[i]) {
+            if (scene_.entities[i].body.valid()) physics_.remove_body(scene_.entities[i].body);
+            editor_.log("[scene] deleted " + scene_.entities[i].name);
+        } else {
+            remap[i] = (int)keep.size();
+            keep.push_back(scene_.entities[i]);
+        }
+    }
+    for (Entity& e : keep)
+        e.parent = (e.parent >= 0 && e.parent < n) ? remap[e.parent] : -1;
+    scene_.entities = std::move(keep);
+    physics_.optimize();
+    editor_.set_selected(-1);
 }
 
 void Engine::clone_selected() {
@@ -780,9 +954,11 @@ void Engine::process_editor_actions() {
             case EditorAction::CloneSelected:    clone_selected();       break;
             case EditorAction::DeleteSelected:   delete_selected();      break;
             case EditorAction::ResetScene:       reset_scene();          break;
-            case EditorAction::SaveScene:        save_scene(scene_path()); break;
+            case EditorAction::SaveScene:        save_scene(scene_path()); editor_.note_saved(); break;
             case EditorAction::LoadScene:        load_scene(scene_path()); break;
             case EditorAction::TogglePlay:       toggle_play();          break;
+            case EditorAction::QuitSaveExit:     save_scene(scene_path()); running_ = false; break;
+            case EditorAction::QuitExit:         running_ = false;       break;
         }
     }
 }
@@ -809,12 +985,28 @@ void Engine::run() {
     const double freq = (double)SDL_GetPerformanceFrequency();
     float fps_avg = 60.0f;
 
+    // Headless verification: ENGINE_SCREENSHOT=<path> renders a few frames, dumps
+    // the final image to <path>, then quits — no window-capture tool needed.
+    const char* shot_env = SDL_getenv("ENGINE_SCREENSHOT");
+    std::string shot_path = shot_env ? shot_env : "";
+    long frame = 0;
+
     while (running_) {
         Uint64 now = SDL_GetPerformanceCounter();
         float dt = (float)((now - last) / freq);
         last = now;
         if (dt > 0.1f) dt = 0.1f;
         fps_avg = fps_avg * 0.9f + (dt > 0 ? 1.0f / dt : 0.0f) * 0.1f;
+
+        if (!shot_path.empty()) {
+            if (frame == 8) {   // overview pose so floor shadows are clearly visible
+                camera_.position = {9.0f, 12.0f, 16.0f};
+                camera_.yaw = -108.0f; camera_.pitch = -34.0f;
+            }
+            if (frame == 20) renderer_.request_screenshot(shot_path);
+            if (frame == 26) running_ = false;   // give the write a couple frames
+        }
+        ++frame;
 
         handle_input(dt);                 // poll events (no camera movement yet)
         if (playing_) { physics_.update(dt); sync_physics(); }
@@ -823,7 +1015,7 @@ void Engine::run() {
         SDL_GetWindowSizeInPixels(window_, &pw, &ph);
         // UI building phase: editor panels first (sets selection), then the gizmo
         // overlay (which can veto the camera), then apply deferred camera input.
-        editor_.draw(ui_.ctx(), pw, ph, scene_, camera_, physics_, project_, fps_avg, icons_);
+        editor_.draw(ui_.ctx(), pw, ph, scene_, camera_, physics_, project_, fps_avg, icons_, materials_);
         editor_.viewport_rect(vp_x_, vp_y_, vp_w_, vp_h_);
         update_gizmo();
         apply_camera(dt);
@@ -831,7 +1023,8 @@ void Engine::run() {
 
         renderer_.render(scene_, camera_, materials_, ui_, vp_x_, vp_y_, vp_w_, vp_h_,
                      editor_.selected(), editor_.show_gizmos() ? editor_.gizmo_mode() : -1,
-                     editor_.gizmo_local(), gizmo_hot_, editor_.show_colliders(), editor_.selection());
+                     editor_.gizmo_local(), gizmo_hot_, editor_.show_colliders(),
+                     editor_.colliders_xray(), editor_.selection());
     }
 }
 

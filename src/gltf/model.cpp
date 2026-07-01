@@ -103,28 +103,29 @@ bool load_glb(const std::string& path, Model& out) {
 
             if (prim->material) {
                 if (prim->material->name) outp.material_name = prim->material->name;
+                // Decode an embedded texture (PNG/JPG in a buffer view) into RGBA.
+                auto decode_tex = [&](const cgltf_texture_view& tv,
+                                      std::vector<uint8_t>& dst, int& dw, int& dh) {
+                    if (!(tv.texture && tv.texture->image && tv.texture->image->buffer_view)) return;
+                    cgltf_buffer_view* bv = tv.texture->image->buffer_view;
+                    if (!(bv->buffer && bv->buffer->data)) return;
+                    const unsigned char* src = (const unsigned char*)bv->buffer->data + bv->offset;
+                    int tw = 0, th = 0, tn = 0;
+                    unsigned char* px = stbi_load_from_memory(src, (int)bv->size, &tw, &th, &tn, 4);
+                    if (px) { dst.assign(px, px + (size_t)tw * th * 4); dw = tw; dh = th; stbi_image_free(px); }
+                };
                 if (prim->material->has_pbr_metallic_roughness) {
                     const cgltf_pbr_metallic_roughness& pmr = prim->material->pbr_metallic_roughness;
                     const float* c = pmr.base_color_factor;
                     outp.base_color = {c[0], c[1], c[2], c[3]};
-                    // Decode the embedded base-colour texture (PNG/JPG in a buffer view).
-                    const cgltf_texture_view& tv = pmr.base_color_texture;
-                    if (tv.texture && tv.texture->image && tv.texture->image->buffer_view) {
-                        cgltf_image* img = tv.texture->image;
-                        cgltf_buffer_view* bv = img->buffer_view;
-                        if (bv->buffer && bv->buffer->data) {
-                            const unsigned char* src = (const unsigned char*)bv->buffer->data + bv->offset;
-                            int tw = 0, th = 0, tn = 0;
-                            unsigned char* px = stbi_load_from_memory(src, (int)bv->size, &tw, &th, &tn, 4);
-                            if (px) {
-                                outp.tex_rgba.assign(px, px + (size_t)tw * th * 4);
-                                outp.tex_w = tw; outp.tex_h = th;
-                                outp.tex_key = path + "#" + std::to_string((size_t)(img - data->images));  // unique per GLB
-                                stbi_image_free(px);
-                            }
-                        }
-                    }
+                    outp.metalness  = pmr.metallic_factor;
+                    outp.roughness  = pmr.roughness_factor;
+                    decode_tex(pmr.base_color_texture, outp.tex_rgba, outp.tex_w, outp.tex_h);
+                    if (!outp.tex_rgba.empty() && pmr.base_color_texture.texture->image)
+                        outp.tex_key = path + "#" + std::to_string((size_t)(pmr.base_color_texture.texture->image - data->images));
+                    decode_tex(pmr.metallic_roughness_texture, outp.mr_rgba, outp.mr_w, outp.mr_h);
                 }
+                decode_tex(prim->material->normal_texture, outp.nrm_rgba, outp.nrm_w, outp.nrm_h);
             }
             outp.mesh.recompute_bounds();
             out.primitives.push_back(std::move(outp));

@@ -21,9 +21,15 @@ struct Primitive {
     MeshData    mesh;
     std::string material_name;       // glTF material name, if any
     em::vec4    base_color {1, 1, 1, 1};
+    float       metalness = 0.0f;    // glTF metallic factor
+    float       roughness = 1.0f;    // glTF roughness factor
     std::vector<uint8_t> tex_rgba;   // decoded base-colour texture (RGBA), empty if none
     int         tex_w = 0, tex_h = 0;
     std::string tex_key;             // dedup key (glTF image index)
+    // Metallic-roughness map (glTF packs roughness in G, metalness in B) and a
+    // tangent-space normal map. Empty when the material has none.
+    std::vector<uint8_t> mr_rgba;   int mr_w = 0, mr_h = 0;
+    std::vector<uint8_t> nrm_rgba;  int nrm_w = 0, nrm_h = 0;
 };
 
 struct Model {

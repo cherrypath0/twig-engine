@@ -6,10 +6,13 @@
 // raises queued actions that the engine (which owns the GPU/scene/physics)
 // performs.
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 struct nk_context;
 struct Scene;
 struct Camera;
+struct Material;
 class  PhysicsWorld;
 class  Project;
 class  IconSet;   // SVG icon textures, owned by the Engine and passed in by ref
@@ -31,6 +34,8 @@ struct EditorAction {
         SaveScene,
         LoadScene,
         TogglePlay,         // start/stop in-editor simulation
+        QuitSaveExit,       // save-prompt: save then exit
+        QuitExit,           // save-prompt: exit without saving
     };
     Type        type;
     std::string s;
@@ -47,12 +52,17 @@ public:
     // them). The DockSpace owns panel layout; the top toolbar stays free-floating.
     void draw(nk_context* ctx, int screen_w, int screen_h,
               Scene& scene, Camera& cam, PhysicsWorld& physics,
-              Project& project, float fps, const IconSet& icons);
+              Project& project, float fps, const IconSet& icons,
+              std::unordered_map<std::string, Material>& materials);
 
     void log(const std::string& line);
 
     // Engine drains queued actions after draw(). Returns false when empty.
     bool poll_action(EditorAction& out);
+    void mark_dirty();               // scene changed since last save
+    bool is_dirty() const;
+    void note_saved();               // clears dirty + shows the "Saved" flash
+    void show_save_prompt();         // open the unsaved-changes-on-exit dialog
 
     int selected() const;
     void set_selected(int i);
@@ -68,6 +78,7 @@ public:
     bool editor_open() const;   // true when the code editor covers the viewport
     bool show_gizmos() const;
     bool show_colliders() const;
+    bool colliders_xray() const;   // true = always on top; false = occluded by geometry
     bool  snap_enabled() const;
     float snap_grid() const;
     float snap_angle() const;
